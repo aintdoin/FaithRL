@@ -1,14 +1,6 @@
 # Learning to Reason Faithfully through Step-Level Faithfulness Maximization
 
 This repository contains the official implementation for the paper **"Learning to Reason Faithfully through Step-Level Faithfulness Maximization"**.
-
-**Authors:**
-Runquan Gui$^{2,1}$, Yafu Li$^{1}$, Xiaoye Qu$^{1}$, Ziyan Liu$^{2}$, Yeqiu Cheng$^{2}$, Yu Cheng$^{3}$
-
-$^1$ Shanghai AI Laboratory
-$^2$ University of Science and Technology of China
-$^3$ The Chinese University of Hong Kong
-
 ---
 
 ## Preliminaries
