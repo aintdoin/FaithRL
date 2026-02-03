@@ -1,6 +1,7 @@
 # Learning to Reason Faithfully through Step-Level Faithfulness Maximization
 
 This repository contains the official implementation for the paper **"Learning to Reason Faithfully through Step-Level Faithfulness Maximization"**.
+
 ---
 
 ## Preliminaries
