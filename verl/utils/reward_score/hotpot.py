@@ -421,6 +421,89 @@ def validate_model_answer(answer_text: str, expected_answer: str, question: str 
         # Compute metrics against all expected answers (including aliases)
         metrics = compute_metrics(answer_text, all_expected_answers)
         return metrics
+def evaluate_model_answer_from_judge_result(
+    answer_text: str,
+    expected_answer: str,
+    question: str = None,
+    judge_result=None,
+    answer_aliases: list = None,
+    answerable_flag: Optional[bool] = None,
+):
+    """Map a raw judge result to the same metric dict as validate_model_answer."""
+    import os
+    all_expected_answers = []
+    if isinstance(expected_answer, list):
+        all_expected_answers.extend(expected_answer)
+    else:
+        all_expected_answers.append(expected_answer)
+    if answer_aliases is not None and len(answer_aliases) > 0:
+        all_expected_answers.extend(answer_aliases)
+    if answerable_flag is None:
+        ans_flag = True
+    else:
+        ans_flag = answerable_flag
+        if not isinstance(ans_flag, bool):
+            raise ValueError(f"answerable_flag must be boolean or None, got {type(answerable_flag)}: {answerable_flag}")
+    if isinstance(judge_result, (int, float)):
+        accuracy = float(judge_result)
+    else:
+        result_clean = str(judge_result).strip()
+        if result_clean in ['-1', '1']:
+            accuracy = float(result_clean)
+        else:
+            match = re.match(r'^\s*(-?\d+)', result_clean)
+            if match:
+                accuracy = float(match.group(1))
+            else:
+                match = re.search(r'-?\d+', result_clean)
+                accuracy = float(match.group()) if match else -1.0
+    is_idk = _is_idk_response(answer_text)
+    idk_penalty_answerable = _get_dynamic_idk_penalty()
+    if ans_flag is True:
+        if accuracy >= 0.99:
+            mapped = idk_penalty_answerable if is_idk else 1.0
+        elif accuracy <= -0.99:
+            mapped = -1.0
+        else:
+            mapped = idk_penalty_answerable if is_idk else -1.0
+    elif ans_flag is False:
+        mapped = 1.0 if (accuracy >= 0.99 or is_idk) else -1.0
+    else:
+        mapped = float(accuracy)
+    enable_length_penalty = os.environ.get('ENABLE_ANSWER_LENGTH_PENALTY', 'false').lower() == 'true'
+    max_free_tokens = int(os.environ.get('ANSWER_MAX_FREE_TOKENS', '10'))
+    penalty_per_token = float(os.environ.get('ANSWER_PENALTY_PER_TOKEN', '0.1'))
+    min_final_reward = float(os.environ.get('ANSWER_MIN_FINAL_REWARD', '-2.0'))
+    final_reward = float(mapped)
+    length_penalty = 0.0
+    if enable_length_penalty:
+        max_applicable_penalty = mapped - min_final_reward
+        raw_penalty = _calculate_length_penalty(
+            answer_text=answer_text,
+            max_free_tokens=max_free_tokens,
+            penalty_per_token=penalty_per_token,
+            max_penalty=float('inf')
+        )
+        length_penalty = min(raw_penalty, max_applicable_penalty)
+        final_reward = max(mapped - length_penalty, min_final_reward)
+    metrics = {
+        "em": float(final_reward),
+        "accuracy": float(final_reward),
+        "f1": float(final_reward),
+        "precision": float(final_reward),
+        "recall": float(final_reward),
+        "cover_em_1": float(final_reward),
+        "cover_em_2": float(final_reward),
+        "base_reward": float(mapped),
+    }
+    if enable_length_penalty and length_penalty > 0:
+        answer_content = _extract_answer_content(answer_text)
+        token_count = _count_tokens_simple(answer_content if answer_content else answer_text)
+        metrics["answer_token_count"] = token_count
+        metrics["length_penalty"] = float(length_penalty)
+    if mapped == 1.0:
+        metrics["acc_num"] = 1
+    return metrics
 def extract_solution(solution_str: str) -> Tuple[Optional[str], str, Optional[str]]:
     """Extracts the final answer and question from the model's response string.
     Args:

@@ -1490,47 +1490,225 @@ class RewardModelWorker(Worker):
             "lacking information",
         ]
         return any(m in t for m in likely_markers)
+    def _build_outcome_verifier_prompt(self, predicted_answer, question, ground_truth_answer, answerable):
+        prefix = f"""Input: Assume you are a human expert in grading predictions given by a model. You are given a question and a model prediction. Judge if the prediction matches the ground truth answer by following these steps:
+1: Take it as granted that the Ground Truth is always correct.
+2: If the Prediction exactly matches the Ground Truth, “score" is 1.
+3: If the Ground Truth is a number, “score" is 1 if and only if the Prediction gives a number that almost exactly matches the ground truth.
+4: If the Prediction is self-contradictory, “score" must be -1.
+5: If the prediction is not answering the question, “score" must be -1.
+6: If the prediction is a concise and correct summary of the ground truth, “score" is 1.
+7: If ground truth contains a set of items, prediction must contain exactly same items for the score to be 1.
+8: Otherwise, “score" is -1.
+Output ONLY one digit: -1 or 1. No text, no explanation.
+You should make the judgment based on provided examples.
+Examples: 
+Question: When did the director of film Lord Richard In The Pantry die?
+Ground Truth: 7 January 1984
+Prediction: January 7, 1984
+Output: 1
+Question: Who is older, Charles Badham or Médéric De Vasselot De Régné?
+Ground Truth: Charles Badham
+Prediction: Médéric De Vasselot De Régné
+Output: -1
+        Question: {question}
+        Ground Truth: {ground_truth_answer}
+        Prediction: """
+        suffix = f"""{predicted_answer}
+        Output: """
+        prompt = prefix + suffix
+        return {
+            'prompt': prompt,
+            'cache_prefix': prefix,
+            'cache_key': "final_correctness_prefix:" + hashlib.sha1(prefix.encode("utf-8", errors="ignore")).hexdigest(),
+            'system_prompt': 'You are a strict answer evaluator. Output only a single digit.',
+            'max_tokens': 5,
+            'answerable': answerable,
+        }
+    def _build_step_verifier_prompt(self, response_str, documents, evidences, valid_response_ids=None, question=None, ground_truth=None, answer_aliases=None, answerable=True):
+        try:
+            import ast
+            import difflib
+            evd = evidences
+            if isinstance(evidences, str):
+                try:
+                    evd = ast.literal_eval(evidences)
+                except Exception:
+                    evd = evidences
+            def _to_text(x):
+                try:
+                    return str(x)
+                except Exception:
+                    return ''
+            if valid_response_ids is not None:
+                ids = [int(x) for x in valid_response_ids]
+                token_offsets = []
+                char_pos = 0
+                for token_id in ids:
+                    token_text = self.input_tokenizer.decode([token_id])
+                    token_len = len(token_text)
+                    token_offsets.append((char_pos, char_pos + token_len))
+                    char_pos += token_len
+            else:
+                enc = self.input_tokenizer(
+                    response_str,
+                    return_offsets_mapping=True,
+                    add_special_tokens=False,
+                )
+                offsets = enc.get('offset_mapping')
+                if isinstance(offsets[0], tuple) or isinstance(offsets[0], list):
+                    token_offsets = [tuple(x) for x in offsets]
+                else:
+                    token_offsets = [tuple(x) for x in offsets[0]]
+                ids = None
+            reasoning_pattern = r'<think>(.*?)</think>'
+            think_matches = list(re.finditer(reasoning_pattern, response_str, re.DOTALL))
+            think_match = think_matches[-1] if think_matches else None
+            if think_match is None:
+                return None
+            t_content_start = think_match.start(1)
+            reasoning_str = response_str[t_content_start:think_match.end(1)]
+            enum_pattern = re.compile(r'(?m)^(\s*)(\d+)\.(\s*)')
+            markers = list(enum_pattern.finditer(reasoning_str))
+            segments_meta = []
+            seen_segments = []
+            def _append_segment(seg_text: str, g_start: int, g_end: int, *, forced: float = None):
+                st = (seg_text or "").strip()
+                if not st:
+                    return
+                segments_meta.append({
+                    'text': st,
+                    'global_start': int(g_start),
+                    'global_end': int(g_end),
+                    'forced': forced,
+                })
+            for i, m in enumerate(markers):
+                num_rel_start = m.start(2)
+                num_rel_end = m.end(2)
+                dot_rel_end = m.end(2) + 1
+                num_global_start = t_content_start + num_rel_start
+                dot_global_end = t_content_start + dot_rel_end
+                seg_rel_start = dot_rel_end
+                if i + 1 < len(markers):
+                    seg_rel_end = markers[i + 1].start(0)
+                else:
+                    seg_rel_end = len(reasoning_str)
+                segment_text = reasoning_str[seg_rel_start:seg_rel_end]
+                global_start = t_content_start + seg_rel_start
+                global_end = t_content_start + seg_rel_end
+                is_repeated = False
+                if segment_text.strip() and seen_segments:
+                    last_seen = seen_segments[-1]
+                    if difflib.SequenceMatcher(None, segment_text, last_seen).ratio() > 0.8:
+                        is_repeated = True
+                    if not is_repeated:
+                        matcher = difflib.SequenceMatcher(None, segment_text, last_seen)
+                        match = matcher.find_longest_match(0, len(segment_text), 0, len(last_seen))
+                        if len(segment_text) > 10 and match.size / len(segment_text) > 0.8:
+                            is_repeated = True
+                if is_repeated:
+                    _append_segment(segment_text, global_start, global_end, forced=-1.0)
+                elif segment_text.strip():
+                    _append_segment(segment_text, global_start, global_end, forced=None)
+                    seen_segments.append(segment_text)
+            if not markers:
+                body = reasoning_str.strip()
+                if body:
+                    _append_segment(body, t_content_start, t_content_start + len(reasoning_str), forced=None)
+            if not segments_meta:
+                return None
+            evd_list = evd if isinstance(evd, (list, tuple)) else [evd]
+            evd_texts = [_to_text(x) for x in evd_list if _to_text(x)]
+            max_evd = 8
+            evd_text = '\n'.join([f"- {t}" for t in evd_texts[:max_evd]]) if evd_texts else ""
+            prefix_lines = []
+            prefix_lines.append("You are a strict reasoning consistency judge.")
+            prefix_lines.append("Task: For EACH segment below, output 1 if it is FULLY SUPPORTED by the evidences; otherwise output 0.")
+            prefix_lines.append("Rules:")
+            prefix_lines.append("1) Output ONLY valid JSON: a list of 0/1 with the same length and order as the segments.")
+            prefix_lines.append("2) Be strict: if a segment is vague, adds unsupported facts, or is not grounded in evidences, output 0.")
+            prefix_lines.append("3) Do not output any explanation or extra text.")
+            if evd_text:
+                prefix_lines.append("")
+                prefix_lines.append(f"Evidences:\n{evd_text}")
+            prefix_lines.append("")
+            prefix_lines.append("Segments:")
+            prefix = "\n".join(prefix_lines) + "\n"
+            seg_lines = [f"{idx}. {seg['text']}" for idx, seg in enumerate(segments_meta, start=1)]
+            suffix = "\n".join(seg_lines) + "\n\nOutput JSON list:"
+            prompt = prefix + suffix
+            return {
+                'prompt': prompt,
+                'cache_prefix': prefix,
+                'cache_key': "reasoning_steps_batch_prefix:" + hashlib.sha1(prefix.encode("utf-8", errors="ignore")).hexdigest(),
+                'system_prompt': 'You are a strict judge. Output JSON only.',
+                'max_tokens': 64,
+                'answerable': answerable,
+                'ctx': {
+                    'response': response_str,
+                    'token_offsets': token_offsets,
+                    'segments_meta': segments_meta,
+                    'valid_response_ids': ids,
+                    'question': question,
+                    'ground_truth': ground_truth,
+                    'answer_aliases': answer_aliases,
+                    'answerable': answerable,
+                    'documents': documents,
+                    'evidences': evidences,
+                },
+            }
+        except Exception:
+            return None
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_rm_score(self, data: DataProto):
+        import json as _json
+        from verl.utils.reward_score import hotpot as hotpot_utils
         data = data.to(torch.cuda.current_device())
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
         format_reward_tensor = torch.zeros(data.batch['responses'].shape[0], dtype=torch.float32)
         answer_reward_tensor = torch.zeros(data.batch['responses'].shape[0], dtype=torch.float32)
         reasoning_reward_tensor = torch.zeros(data.batch['responses'].shape[0], dtype=torch.float32)
         sentence_mask_tensor = torch.ones_like(data.batch['responses'], dtype=torch.float32)
-        # perform forward computation
+        batchable_sources = {'hotpot', '2wikimultihop', 'musique'}
+        use_llm_judge = os.environ.get('USE_LLM_JUDGE', 'false').lower() == 'true'
+
+        def _mark_span(mask, offsets, char_start, char_end, value):
+            for ti, (ts, te) in enumerate(offsets):
+                if te > char_start and ts < char_end:
+                    mask[ti] = float(value)
+
         with self.ulysses_sharding_manager:
-            # Track judge-server FLOPs (if enabled) during this call
             try:
                 from verl.utils.reward_score.answer_postprocessor import get_postprocessor
                 post = get_postprocessor()
-                _judge_flops_before = float(getattr(post, "_judge_server_flops_total", 0.0))
             except Exception:
                 post = None
-                _judge_flops_before = 0.0
+            batch_jobs = []
+            batch_samples = []
+
             for i in range(len(data)):
-                data_item = data[i]  # DataProtoItem
+                data_item = data[i]
                 prompt_ids = data_item.batch['prompts']
                 prompt_length = prompt_ids.shape[-1]
-                valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+                valid_prompt_length = int(data_item.batch['attention_mask'][:prompt_length].sum().item())
                 valid_prompt_ids = prompt_ids[-valid_prompt_length:]
                 response_ids = data_item.batch['responses']
-                valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+                valid_response_length = int(data_item.batch['attention_mask'][prompt_length:].sum().item())
                 valid_response_ids = response_ids[:valid_response_length]
-                # decode
                 sequences = torch.cat((valid_prompt_ids, valid_response_ids))
                 sequences_str = self.input_tokenizer.decode(sequences)
-                sequences_input = self.input_tokenizer.decode(valid_response_ids)
-                documents = data_item.non_tensor_batch['documents'] # [[key, [list]]]
-                ground_truth = data_item.non_tensor_batch['answer'] # str
+                response_str = self.input_tokenizer.decode(valid_response_ids)
+
+                documents = data_item.non_tensor_batch['documents']
+                ground_truth = data_item.non_tensor_batch['answer']
+                evidences = data_item.non_tensor_batch['evidences']
                 data_source = data_item.non_tensor_batch['data_source']
                 strategy = os.environ.get('STRATEGY', None)
                 compute_score_fn = self._select_rm_score_fn(data_source)
-                # extract answerable strictly from extra_info
+
                 extra_info = data_item.non_tensor_batch.get('extra_info', {})
                 if isinstance(extra_info, str):
                     try:
-                        import json as _json
                         extra_info = _json.loads(extra_info)
                     except Exception:
                         extra_info = {}
@@ -1544,143 +1722,244 @@ class RewardModelWorker(Worker):
                     answerable_flag = raw_flag
                 else:
                     answerable_flag = True
-                # Extract answer_aliases for data sources that support it
                 answer_aliases = extra_info.get('answer_aliases', []) if isinstance(extra_info, dict) else []
-                # Call compute_score_fn with or without answer_aliases based on data source
-                if data_source in ['hotpot', '2wikimultihop', 'musique']:
-                    format_score, answer_score, base_reward = compute_score_fn(
-                        response=sequences_str,
-                        ground_truth=ground_truth,
-                        documents=documents,
-                        answerable=answerable_flag,
-                        answer_aliases=answer_aliases,
-                        enable_postprocessing=True,
-                    )
-                else:
-                    format_score, answer_score, base_reward = compute_score_fn(
-                        response=sequences_str,
-                        ground_truth=ground_truth,
-                        documents=documents,
-                        answerable=answerable_flag,
-                    )
-                # Note: base_reward is not used in training, only stored for validation
-                evidences = data_item.non_tensor_batch['evidences']
-                # Default total_score calculation (can be overridden by strategies)
-                resp_len_int = int(valid_response_length.item() if hasattr(valid_response_length, "item") else int(valid_response_length))
-                if resp_len_int > 500:
-                    excess_tokens = resp_len_int - 500
-                    excess_hundreds = (excess_tokens + 99) // 100
-                    length_penalty = 0.2 * excess_hundreds
-                else:
-                    length_penalty = 0.0
-                total_score = float(answer_score) - length_penalty
-                if strategy == 'grpo':
-                    reasoning_score = 0
-                    sentence_mask_tensor[i, :] = 0.0
-                elif strategy == 'knowrl':
-                    # KnowRL: R_total = r_format + r_correct + r_fact
-                    # 1. r_format: +1 if correct, -1 if incorrect
-                    if format_score == -2:
-                        r_format = -1.0
-                    else:
-                        r_format = 1.0
-                    # 2. r_fact: (true count / total count) -> 0~1
-                    # validate_model_reasoning_documents_only returns mean of scores.
-                    # We set positive=1.0, negative=0.0 so mean is exactly true/total.
-                    # If total=0, it returns 0.0.
-                    reasoning_score, sentence_mask = self.validate_model_reasoning_documents_only(
-                        documents, 
-                        sequences_input,
-                        valid_response_ids=valid_response_ids,
-                        positive_score=1.0, 
-                        negative_score=0.0
-                    )
-                    r_fact = reasoning_score
-                    # Also populate sentence_mask_tensor for potential logging/analysis
-                    mask_length = min(len(valid_response_ids), len(sentence_mask))
-                    sentence_mask_tensor[i, :mask_length] = torch.tensor(sentence_mask[:mask_length], dtype=torch.float32)
-                    # 3. r_correct: +2 correct, -1 incorrect, +1 IDK
-                    if answer_score == 1.0:
-                        r_correct = 2.0
-                    else:
-                        # Check for IDK in the answer part
-                        try:
-                            question_text = data_item.non_tensor_batch.get('question', None)
-                        except:
-                            question_text = None
-                        # Extract answer text to check for IDK
-                        ans_str = self.extract_solution(sequences_input)
-                        if self._check_insufficient_info(ans_str, question=question_text):
-                            r_correct = 1.0
-                        else:
-                            r_correct = -1.0
-                    # Override total_score
-                    total_score = r_format + r_correct + r_fact
-                else:
-                    # Initialize current row to 0 first (since default init was ones)
-                    sentence_mask_tensor[i, :] = 0.0
-                    if format_score == -2:
-                        reasoning_score = 0
+                try:
+                    question_text = data_item.non_tensor_batch.get('question', None)
+                except Exception:
+                    question_text = None
+
+                resp_len_int = valid_response_length
+                length_penalty = 0.2 * ((resp_len_int - 500 + 99) // 100) if resp_len_int > 500 else 0.0
+
+                batchable = use_llm_judge and data_source in batchable_sources and post is not None and getattr(post, 'use_judge_api', False)
+                if batchable:
+                    answer_text, processed_str, extracted_question = hotpot_utils.extract_solution(sequences_str)
+                    question_text = question_text or extracted_question
+                    format_correct = hotpot_utils.validate_response_structure(processed_str)
+                    format_score = 0 if format_correct else -1
+                    if not format_correct or not answer_text:
+                        answer_score = -1.0
+                        reasoning_score = 0.0
+                        total_score = answer_score - length_penalty
+                        reward_tensor[i, valid_response_length - 1] = total_score
+                        format_reward_tensor[i] = format_score
+                        answer_reward_tensor[i] = answer_score
+                        reasoning_reward_tensor[i] = reasoning_score
                         sentence_mask_tensor[i, :] = 0.0
-                        # Removed verbose print to reduce log clutter
-                        # print(f"\n[Reasoning Validation] Skipped due to format errors (Reasoning score: {reasoning_score})")
-                    else:
-                        # CRITICAL: Pass valid_response_ids directly to ensure alignment
-                        # try to get question if available in batch (optional)
-                        try:
-                            question_text = data_item.non_tensor_batch['question']
-                        except Exception:
-                            question_text = None
-                        if strategy == 'fspo':
-                            evidences = documents
-                        reasoning_score, sentence_mask = self.validate_model_reasoning_stepwise(
-                            sequences_input,
-                            documents,
-                            evidences,
+                        continue
+
+                    batch_samples.append({
+                        'row': i,
+                        'response_text': response_str,
+                        'valid_response_ids': valid_response_ids,
+                        'valid_response_length': valid_response_length,
+                        'format_score': format_score,
+                        'answer_text': answer_text,
+                        'question': question_text,
+                        'ground_truth': ground_truth,
+                        'answer_aliases': answer_aliases,
+                        'answerable_flag': answerable_flag,
+                        'documents': documents,
+                        'evidences': evidences,
+                        'strategy': strategy,
+                        'length_penalty': length_penalty,
+                    })
+                    batch_jobs.append({
+                        'row': i,
+                        'kind': 'outcome',
+                        'prompt_item': self._build_outcome_verifier_prompt(
+                            predicted_answer=answer_text,
+                            question=question_text,
+                            ground_truth_answer=ground_truth,
+                            answerable=answerable_flag,
+                        ),
+                    })
+                    if strategy in ['grpo_evar_math_weighted', 'fspo']:
+                        step_prompt = self._build_step_verifier_prompt(
+                            response_str=response_str,
+                            documents=documents,
+                            evidences=evidences,
                             valid_response_ids=valid_response_ids,
                             question=question_text,
                             ground_truth=ground_truth,
                             answer_aliases=answer_aliases,
                             answerable=answerable_flag,
                         )
-                        # sentence_mask length MUST match valid_response_ids length
+                        if step_prompt is not None:
+                            batch_samples[-1]['step_ctx'] = step_prompt['ctx']
+                            batch_jobs.append({
+                                'row': i,
+                                'kind': 'step',
+                                'prompt_item': step_prompt,
+                            })
+                    continue
+
+                # Fallback path for non-batchable cases or when the judge server is disabled.
+                format_score, answer_score, base_reward = compute_score_fn(
+                    response=sequences_str,
+                    ground_truth=ground_truth,
+                    documents=documents,
+                    answerable=answerable_flag,
+                    answer_aliases=answer_aliases if data_source in ['hotpot', '2wikimultihop', 'musique'] else None,
+                    enable_postprocessing=True,
+                ) if data_source in ['hotpot', '2wikimultihop', 'musique'] else compute_score_fn(
+                    response=sequences_str,
+                    ground_truth=ground_truth,
+                    documents=documents,
+                    answerable=answerable_flag,
+                )
+
+                if strategy == 'grpo':
+                    reasoning_score = 0.0
+                    sentence_mask_tensor[i, :] = 0.0
+                    total_score = float(answer_score) - length_penalty
+                elif strategy == 'knowrl':
+                    if format_score == -2:
+                        r_format = -1.0
+                    else:
+                        r_format = 1.0
+                    reasoning_score, sentence_mask = self.validate_model_reasoning_documents_only(
+                        documents,
+                        response_str,
+                        valid_response_ids=valid_response_ids,
+                        positive_score=1.0,
+                        negative_score=0.0,
+                    )
+                    mask_length = min(len(valid_response_ids), len(sentence_mask))
+                    sentence_mask_tensor[i, :mask_length] = torch.tensor(sentence_mask[:mask_length], dtype=torch.float32)
+                    if answer_score == 1.0:
+                        r_correct = 2.0
+                    else:
+                        ans_str = self.extract_solution(response_str)
+                        if self._check_insufficient_info(ans_str, question=question_text):
+                            r_correct = 1.0
+                        else:
+                            r_correct = -1.0
+                    total_score = r_format + r_correct + reasoning_score
+                else:
+                    sentence_mask_tensor[i, :] = 0.0
+                    if format_score == -2:
+                        reasoning_score = 0.0
+                        total_score = float(answer_score) - length_penalty
+                    else:
+                        reasoning_score, sentence_mask = self.validate_model_reasoning_stepwise(
+                            response_str,
+                            documents,
+                            evidences if strategy != 'fspo' else documents,
+                            valid_response_ids=valid_response_ids,
+                            question=question_text,
+                            ground_truth=ground_truth,
+                            answer_aliases=answer_aliases,
+                            answerable=answerable_flag,
+                        )
                         mask_length = min(len(valid_response_ids), len(sentence_mask))
                         sentence_mask_tensor[i, :mask_length] = torch.tensor(sentence_mask[:mask_length], dtype=torch.float32)
-                # Removed verbose prints to reduce log clutter
-                # print("\n" + "-" * 80)
-                # print(f" Final Score ".center(80, '-'))
-                # print(f"  Format score: {format_score}")
-                # print(f"  Answer score: {answer_score}")
-                # print(f"  Reasoning score: {reasoning_score}")
-                # Logic moved to start of loop to allow override
-                # try:
-                #     resp_len_int = int(valid_response_length.item() if hasattr(valid_response_length, "item") else int(valid_response_length))
-                # except Exception:
-                #     # Fallback: best-effort conversion
-                #     resp_len_int = int(valid_response_length) if not isinstance(valid_response_length, torch.Tensor) else int(valid_response_length.detach().cpu().item())
-                # if resp_len_int > 500:
-                #     excess_tokens = resp_len_int - 500
-                #     excess_hundreds = (excess_tokens + 99) // 100
-                #     length_penalty = 0.1 * excess_hundreds
-                # else:
-                #     length_penalty = 0.0
-                # total_score = float(answer_score) - length_penalty
+                        total_score = float(answer_score) - length_penalty
+
                 reward_tensor[i, valid_response_length - 1] = total_score
                 format_reward_tensor[i] = format_score
                 answer_reward_tensor[i] = answer_score
                 reasoning_reward_tensor[i] = reasoning_score
-            for sample_idx in range(min(3, sentence_mask_tensor.shape[0])):
-                sample_mask = sentence_mask_tensor[sample_idx]
-                nonzero_count = (sample_mask != 0).sum().item()
-                unique_values = torch.unique(sample_mask).cpu().tolist()
-            output = DataProto.from_dict(tensors={'reward_scores': reward_tensor,
-                                                  'format_scores': format_reward_tensor,
-                                                  'answer_scores': answer_reward_tensor,
-                                                  'reasoning_scores': reasoning_reward_tensor,
-                                                  'sentence_mask': sentence_mask_tensor})
+
+            if batch_jobs and post is not None and getattr(post, 'use_judge_api', False):
+                prompts = [job['prompt_item'] for job in batch_jobs if job.get('prompt_item') is not None]
+                raw_results = post.judge_prompt_batch(prompts)
+                row2raw = {}
+                for job, raw in zip(batch_jobs, raw_results):
+                    if job.get('prompt_item') is None:
+                        continue
+                    row2raw.setdefault(job['row'], {})[job['kind']] = raw
+
+                for sample in batch_samples:
+                    row = sample['row']
+                    raw_outcome = row2raw.get(row, {}).get('outcome', '')
+                    metrics = hotpot_utils.evaluate_model_answer_from_judge_result(
+                        answer_text=sample['answer_text'],
+                        expected_answer=sample['ground_truth'],
+                        question=sample['question'],
+                        judge_result=raw_outcome,
+                        answer_aliases=sample['answer_aliases'],
+                        answerable_flag=sample['answerable_flag'],
+                    )
+                    answer_score = float(metrics.get('f1', -1.0))
+                    format_score = sample['format_score']
+                    length_penalty = sample['length_penalty']
+                    reasoning_score = 0.0
+                    sentence_mask = None
+
+                    if sample['strategy'] == 'knowrl':
+                        reasoning_score, sentence_mask = self.validate_model_reasoning_documents_only(
+                            sample['documents'],
+                            sample['response_text'],
+                            valid_response_ids=sample['valid_response_ids'],
+                            positive_score=1.0,
+                            negative_score=0.0,
+                        )
+                        mask_length = min(len(sample['valid_response_ids']), len(sentence_mask))
+                        sentence_mask_tensor[row, :mask_length] = torch.tensor(sentence_mask[:mask_length], dtype=torch.float32)
+                        if answer_score == 1.0:
+                            r_correct = 2.0
+                        else:
+                            ans_str = self.extract_solution(sample['response_text'])
+                            if self._check_insufficient_info(ans_str, question=sample['question']):
+                                r_correct = 1.0
+                            else:
+                                r_correct = -1.0
+                        r_format = -1.0 if format_score == -2 else 1.0
+                        total_score = r_format + r_correct + reasoning_score
+                    elif sample['strategy'] in ['grpo_evar_math_weighted', 'fspo']:
+                        step_ctx = sample.get('step_ctx')
+                        raw_step = row2raw.get(row, {}).get('step', '')
+                        if step_ctx is not None and raw_step:
+                            try:
+                                parsed = _json.loads(raw_step.strip())
+                            except Exception:
+                                parsed = []
+                            if not isinstance(parsed, list) or len(parsed) != len(step_ctx.get('segments_meta', [])):
+                                reasoning_score, sentence_mask = self.validate_model_reasoning_stepwise(
+                                    sample['response_text'],
+                                    sample['documents'],
+                                    sample['evidences'] if sample['strategy'] != 'fspo' else sample['documents'],
+                                    valid_response_ids=sample['valid_response_ids'],
+                                    question=sample['question'],
+                                    ground_truth=sample['ground_truth'],
+                                    answer_aliases=sample['answer_aliases'],
+                                    answerable=sample['answerable_flag'],
+                                )
+                            else:
+                                sentence_mask = [0.0] * len(step_ctx['token_offsets'])
+                                for seg, val in zip(step_ctx['segments_meta'], parsed):
+                                    score = 1.0 if float(val) >= 0.5 else 0.0
+                                    _mark_span(sentence_mask, step_ctx['token_offsets'], seg['global_start'], seg['global_end'], score)
+                                response = step_ctx['response']
+                                for tag in (r'<think>', r'</think>', r'<answer>', r'</answer>'):
+                                    for m in re.finditer(tag, response):
+                                        _mark_span(sentence_mask, step_ctx['token_offsets'], m.start(), m.end(), 1.0)
+                                for m in re.finditer(r'<answer>(.*?)</answer>', response, re.DOTALL):
+                                    _mark_span(sentence_mask, step_ctx['token_offsets'], m.start(1), m.end(1), 2.0)
+                                reasoning_score = float(sum(1.0 if float(v) >= 0.5 else 0.0 for v in parsed) / len(parsed)) if parsed else 0.0
+                            mask_length = min(len(sample['valid_response_ids']), len(sentence_mask))
+                            sentence_mask_tensor[row, :mask_length] = torch.tensor(sentence_mask[:mask_length], dtype=torch.float32)
+                        total_score = answer_score - length_penalty
+                    else:
+                        sentence_mask_tensor[row, :] = 0.0
+                        total_score = answer_score - length_penalty
+
+                    reward_tensor[row, sample['valid_response_length'] - 1] = total_score
+                    format_reward_tensor[row] = format_score
+                    answer_reward_tensor[row] = answer_score
+                    reasoning_reward_tensor[row] = reasoning_score
+
+            output = DataProto.from_dict(tensors={
+                'reward_scores': reward_tensor,
+                'format_scores': format_reward_tensor,
+                'answer_scores': answer_reward_tensor,
+                'reasoning_scores': reasoning_reward_tensor,
+                'sentence_mask': sentence_mask_tensor,
+            })
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
+
         output = output.to('cpu')
-        # Collect judge-server FLOPs accrued in this compute_rm_score call
         try:
             judge_flops = float(post.consume_judge_server_flops()) if post is not None else 0.0
         except Exception:

@@ -359,12 +359,8 @@ Output: -1
         prompt = prefix + suffix
         # Call judge API (using thread pool for async execution)
         try:
-            # concise call log
-            # Submit to thread pool and wait for result
             _cache_key = "final_correctness_prefix:" + hashlib.sha1(prefix.encode("utf-8", errors="ignore")).hexdigest()
-            future = self.executor.submit(self._call_judge_api, prompt, cache_prefix=prefix, cache_key=_cache_key)
-            result = future.result(timeout=self.request_timeout + 5)  # Add buffer to timeout
-            # print concise result head
+            result = self._call_judge_api(prompt, cache_prefix=prefix, cache_key=_cache_key)
             # Parse result - should be single digit: -1 or 1
             result_clean = result.strip()
             # ROBUST parsing: handle various output formats
@@ -395,6 +391,51 @@ Output: -1
                 raise ValueError(f"Score {score} not in {{-1, 1}}")
         except Exception as e:
             return -1
+    def judge_prompt_batch(self, prompts: list[dict]) -> list[str]:
+        """
+        Submit a batch of raw judge prompts concurrently.
+
+        Each item should contain:
+            - prompt: full prompt string
+            - cache_prefix: optional shared prefix for cache accounting
+            - cache_key: optional stable cache key
+            - system_prompt: optional system prompt
+            - max_tokens: optional max token cap
+        """
+        if not prompts:
+            return []
+        if not self.use_judge_api or not self.executor:
+            results = []
+            for item in prompts:
+                try:
+                    results.append(self._call_judge_api(
+                        item['prompt'],
+                        cache_prefix=item.get('cache_prefix'),
+                        cache_key=item.get('cache_key'),
+                        system_prompt=item.get('system_prompt'),
+                        max_tokens=int(item.get('max_tokens', 5)),
+                    ))
+                except Exception:
+                    results.append('')
+            return results
+        futures = {}
+        for idx, item in enumerate(prompts):
+            futures[self.executor.submit(
+                self._call_judge_api,
+                item['prompt'],
+                cache_prefix=item.get('cache_prefix'),
+                cache_key=item.get('cache_key'),
+                system_prompt=item.get('system_prompt'),
+                max_tokens=int(item.get('max_tokens', 5)),
+            )] = idx
+        results = [''] * len(prompts)
+        for future in concurrent.futures.as_completed(futures):
+            idx = futures[future]
+            try:
+                results[idx] = future.result(timeout=self.request_timeout + 10)
+            except Exception:
+                results[idx] = ''
+        return results
     def judge_batch(self, items: list) -> list:
         """
         Batch judge multiple answers concurrently using thread pool.
